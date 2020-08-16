@@ -14,25 +14,40 @@ metadata:
 spec:
   containers:
   - name: kaniko
-    image: gcr.io/kaniko-project/executor:debug
+    image: gcr.io/kaniko-project/executor:debug-v0.15.0
     imagePullPolicy: IfNotPresent
     command:
     - /busybox/cat
     tty: true
+    env:
+      - name: GIT_ACCESS_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: jenkins-credentials
+            key: gitReadAccessToken 
+      - name: token
+        valueFrom:
+          secretKeyRef:
+            name: jenkins-credentials
+            key: gitReadAccessToken             
+      - name: "GOOGLE_APPLICATION_CREDENTIALS"
+        value: "/var/run/secret/cloud.google.com/service-account.json"             
     volumeMounts:
       - name: jenkins-docker-cfg
         mountPath: /root
       - name: kaniko-cache
         mountPath: /cache  
+      - name: service-account
+        mountPath: /var/run/secret/cloud.google.com        
     resources:
       requests:
         memory: "1792Mi"
         cpu: "750m"
       limits:
-        memory: "2560Mi"
-        cpu: "1250m"      
+        memory: "3572Mi"
+        cpu: "1500m"      
   - name: git
-    image: docker.io/nithindv/alpine-git:latest
+    image: docker.io/egovio/builder:2-64da60a1-version_script_update-NA
     imagePullPolicy: IfNotPresent
     command:
     - cat
@@ -42,6 +57,9 @@ spec:
     persistentVolumeClaim:
       claimName: kaniko-cache-claim
       readOnly: true      
+  - name: service-account
+    secret:
+        secretName: "gcp-docker-push-sa"      
   - name: jenkins-docker-cfg
     projected:
       sources:
@@ -55,9 +73,12 @@ spec:
         node(POD_LABEL) {
 
             def scmVars = checkout scm
-            String REPO_NAME = env.REPO_NAME ? env.REPO_NAME : "docker.io/egovio";           
+            String REPO_NAME = env.REPO_NAME ? env.REPO_NAME : "docker.io/egovio";         
+            String GCR_REPO_NAME = "asia.gcr.io/digit-egov";
             def yaml = readYaml file: pipelineParams.configFile;
             List<JobConfig> jobConfigs = ConfigParser.parseConfig(yaml, env);
+            String serviceCategory = null;
+            String buildNum = null;
 
             for(int i=0; i<jobConfigs.size(); i++){
                 JobConfig jobConfig = jobConfigs.get(i)
@@ -67,8 +88,11 @@ spec:
                              "PATH=alpine:$PATH"
                     ]) {
                         container(name: 'git', shell: '/bin/sh') {
+                            scmVars['VERSION'] = sh (script:
+                                    '/scripts/get_application_version.sh ${BUILD_PATH}',
+                                    returnStdout: true).trim()
                             scmVars['ACTUAL_COMMIT'] = sh (script:
-                                    'git log --oneline -- ${BUILD_PATH} | awk \'NR==1{print $1}\'',
+                                    '/scripts/get_folder_commit.sh ${BUILD_PATH}',
                                     returnStdout: true).trim()
                             scmVars['BRANCH'] = scmVars['GIT_BRANCH'].replaceFirst("origin/", "")
                         }
@@ -87,12 +111,39 @@ spec:
                                     throw new Exception("Working directory / dockerfile does not exist!");
 
                                 String workDir = buildConfig.getWorkDir().replaceFirst(getCommonBasePath(buildConfig.getWorkDir(), buildConfig.getDockerFile()), "./")
-                                String image = "${REPO_NAME}/${buildConfig.getImageName()}:${env.BUILD_NUMBER}-${scmVars.BRANCH}-${scmVars.ACTUAL_COMMIT}";
+                                String image = null;
+                                if(scmVars.BRANCH.equalsIgnoreCase("master")) {
+                                  image = "${REPO_NAME}/${buildConfig.getImageName()}:${env.BUILD_NUMBER}-v${scmVars.VERSION}-${scmVars.ACTUAL_COMMIT}";
+                                } else {
+                                  image = "${REPO_NAME}/${buildConfig.getImageName()}:${env.BUILD_NUMBER}-${scmVars.BRANCH}-${scmVars.ACTUAL_COMMIT}";
+                                } 
+                                serviceCategory = buildConfig.getServiceCategoryName();  // Dashboard
+                                buildNum = "${scmVars.VERSION}"; // Dashboard
                                 String noPushImage = env.NO_PUSH ? env.NO_PUSH : false;
+                                echo "ALT_REPO_PUSH ENABLED: ${ALT_REPO_PUSH}"
+                                 if(env.ALT_REPO_PUSH.equalsIgnoreCase("true")){
+                                  String gcr_image = "${GCR_REPO_NAME}/${buildConfig.getImageName()}:${env.BUILD_NUMBER}-${scmVars.BRANCH}-${scmVars.VERSION}-${scmVars.ACTUAL_COMMIT}";
+                                  sh """
+                                    echo \"Attempting to build image,  ${image}\"
+                                    /kaniko/executor -f `pwd`/${buildConfig.getDockerFile()} -c `pwd`/${buildConfig.getContext()} \
+                                    --build-arg WORK_DIR=${workDir} \
+                                    --build-arg token=\$GIT_ACCESS_TOKEN \
+                                    --cache=true --cache-dir=/cache \
+                                    --single-snapshot=true \
+                                    --snapshotMode=time \
+                                    --destination=${image} \
+                                    --destination=${gcr_image} \
+                                    --no-push=${noPushImage} \
+                                    --cache-repo=egovio/cache/cache
+                                  """  
+                                  echo "${image} and ${gcr_image} pushed successfully!!"                              
+                                }
+                                else{
                                 sh """
                                     echo \"Attempting to build image,  ${image}\"
                                     /kaniko/executor -f `pwd`/${buildConfig.getDockerFile()} -c `pwd`/${buildConfig.getContext()} \
                                     --build-arg WORK_DIR=${workDir} \
+                                    --build-arg token=\$GIT_ACCESS_TOKEN \
                                     --cache=true --cache-dir=/cache \
                                     --single-snapshot=true \
                                     --snapshotMode=time \
@@ -101,13 +152,24 @@ spec:
                                     --cache-repo=egovio/cache/cache
                                 """
                                 echo "${image} pushed successfully!"
+                                }                                
                             }
                         }
                     }
                 }
+                // stage ("Update dashboard") {
+                //         environmentDashboard {
+                //             environmentName(scmVars.BRANCH)  
+                //             componentName(serviceCategory)
+                //             buildNumber(buildNum)
+                //             //buildJob(String buildJob)
+                //             //packageName(String packageName)
+                //             //addColumns(true)
+                //             //Date now = new Date()                                
+                //             //columns(String Date, now.format("yyMMdd.HHmm", TimeZone.getTimeZone('UTC'))) 
+                //     }    
+                // }    
             }
-
-
         }
     }
 
